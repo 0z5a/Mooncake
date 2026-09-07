@@ -360,6 +360,9 @@ std::string ZMQClient::ProcessMessage() {
 std::string ZMQClient::DispatchMessage(const std::string& topic,
                                        int64_t sequence, const char* payload,
                                        size_t payload_size) {
+    if (stop_requested_.load()) {
+        return "client stopped";
+    }
     const MessageMetadata metadata{
         .publisher_kind = config_.publisher_kind,
         .endpoint = config_.endpoint,
@@ -434,8 +437,15 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
     U64ToBigEndian(static_cast<uint64_t>(from_seq), req);
 
     try {
+        // Keep each receive interruptible without shortening the configured
+        // per-message replay timeout, including an infinite timeout (-1).
+        constexpr auto kStopPollInterval = std::chrono::milliseconds(50);
+        const auto receive_timeout =
+            config_.replay_timeout.count() < 0
+                ? kStopPollInterval
+                : std::min(config_.replay_timeout, kStopPollInterval);
         socket->set(::zmq::sockopt::rcvtimeo,
-                    static_cast<int>(config_.replay_timeout.count()));
+                    static_cast<int>(receive_timeout.count()));
 
         // A DEALER must add the empty delimiter that a REQ socket would add
         // automatically. vLLM's ROUTER expects [identity, empty, from_seq].
@@ -457,10 +467,21 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
         int64_t next_expected = from_seq;
         while (true) {
             std::vector<::zmq::message_t> frames;
-            const auto frame_count = ::zmq::recv_multipart(
-                *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
-            if (!frame_count) {
-                return fail("failed to receive replay response: timed out");
+            const auto receive_start = std::chrono::steady_clock::now();
+            while (true) {
+                if (stop_requested_.load()) {
+                    // Stop owns socket cleanup after the loop has joined.
+                    return "client stopped";
+                }
+                if (::zmq::recv_multipart(*socket, std::back_inserter(frames),
+                                          ::zmq::recv_flags::none)) {
+                    break;
+                }
+                if (config_.replay_timeout.count() >= 0 &&
+                    std::chrono::steady_clock::now() - receive_start >=
+                        config_.replay_timeout) {
+                    return fail("failed to receive replay response: timed out");
+                }
             }
             if (frames.size() != 4 || !frames[0].empty()) {
                 return fail("invalid replay response frame count or delimiter");
